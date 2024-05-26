@@ -37,10 +37,8 @@ fn wave_bytes(samples_sz: u32, appendix_sz: u32) -> Vec<u8> {
 fn wave_cursor_read_seek() {
     const SAMPLES_SZ: u32 = 88200;
     const APPENDIX_SZ: u32 = 200;
-    const NEW_RIFF_SZ: u32 = 4
-        + SAMPLES_SZ
-        + WAVE_FMT_SZ as u32
-        + 2 * RIFF_HEAD_SZ as u32;
+    const NEW_RIFF_SZ: u32 =
+        4 + SAMPLES_SZ + WAVE_FMT_SZ as u32 + 2 * RIFF_HEAD_SZ as u32;
     let bytes = wave_bytes(SAMPLES_SZ, APPENDIX_SZ);
     let mut base_cursor = io::Cursor::new(&bytes[..]);
     let mut split = SplitCursor::new(&mut base_cursor).unwrap();
@@ -94,4 +92,26 @@ fn wave_cursor_read_seek() {
     let pos = wave_cursor.seek(SeekFrom::End(0)).unwrap();
 
     assert_eq!(pos, (RIFF_HEAD_SZ as u64) + (NEW_RIFF_SZ as u64));
+}
+
+#[test]
+fn wave_cursor_end() {
+    const SAMPLES_SZ: u32 = 1024;
+    const APPENDIX_SZ: u32 = 2;
+    let bytes = wave_bytes(SAMPLES_SZ, APPENDIX_SZ);
+    let byte_ct = bytes.len();
+    let mut base_cursor = io::Cursor::new(&bytes[..]);
+    let mut split = SplitCursor::new(&mut base_cursor).unwrap();
+    let mut wave_cursor = split.wave_cursor().unwrap();
+    let mut buf = Vec::new();
+    let mut byte_buf = vec![0u8];
+    wave_cursor.read_to_end(&mut buf).unwrap();
+    let last_pos = wave_cursor.stream_position().unwrap();
+    let seek_end = wave_cursor.seek(SeekFrom::End(0)).unwrap();
+    assert_eq!(last_pos, seek_end);
+    let result = wave_cursor.read_exact(&mut byte_buf[..]);
+
+    if let Ok(_) = result {
+        panic!("Wave cursor read result did not error");
+    }
 }

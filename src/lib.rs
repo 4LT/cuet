@@ -109,6 +109,11 @@ impl<'a, Cursor: Read + Seek> Read for WaveCursor<'a, Cursor> {
                 .unwrap()
                 .min(buf.len());
 
+        let max_read_ct = buf.len().min(
+            usize::try_from(self.end.saturating_sub(self.position))
+                .map_err(|_| read_err())?,
+        );
+
         let head_start =
             usize::try_from(self.position.min(RIFF_HEAD_SZ)).unwrap();
 
@@ -122,7 +127,9 @@ impl<'a, Cursor: Read + Seek> Read for WaveCursor<'a, Cursor> {
             .checked_add(self.offset)
             .ok_or(read_err())
             .and_then(|start| self.base_cursor.seek(SeekFrom::Start(start)))
-            .and_then(|_| self.base_cursor.read(&mut buf[head_bytes..]))?;
+            .and_then(|_| {
+                self.base_cursor.read(&mut buf[head_bytes..max_read_ct])
+            })?;
 
         let total_bytes =
             read_bytes.checked_add(head_bytes).ok_or(read_err())?;
