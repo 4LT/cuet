@@ -1,117 +1,172 @@
-use crate::{SplitCursor, WaveCursor};
-use io::{Read, Seek, SeekFrom};
+use crate::{
+    append_cue_chunk, parse_cue_points, ChunkHead, CuePoint, WaveCursor,
+    CHUNK_HEAD_SZ, CUE_SZ,
+};
+use io::Seek;
 use std::io;
 
-const RIFF_HEAD_SZ: usize = 8;
-const WAVE_FMT_SZ: usize = 22; // not repr. of real wav file
-
-fn riff_head(sz: u32) -> [u8; RIFF_HEAD_SZ] {
-    let mut head = [0u8; RIFF_HEAD_SZ];
-    (&mut head[0..4]).copy_from_slice(b"RIFF");
-    (&mut head[4..RIFF_HEAD_SZ]).copy_from_slice(&sz.to_le_bytes());
-    head
+fn riff_head(size: u32) -> ChunkHead {
+    ChunkHead {
+        tag: *b"RIFF",
+        size,
+    }
 }
 
-fn wave_bytes(samples_sz: u32, appendix_sz: u32) -> Vec<u8> {
-    let mut v = Vec::<u8>::new();
-    let riff_sz: u32 = 4 // "WAVE"
-        + (RIFF_HEAD_SZ as u32) // "fmt " + sz
-        + (WAVE_FMT_SZ as u32)
-        + (RIFF_HEAD_SZ as u32) // "data" + sz
-        + samples_sz
-        + appendix_sz;
+fn real_size(size: u32) -> u32 {
+    if size & 1 == 1 {
+        size + 1
+    } else {
+        size
+    }
+}
 
-    v.extend_from_slice(&riff_head(riff_sz));
+fn wave_bytes(chunk_heads: &[(ChunkHead, Option<&[u8]>)]) -> Vec<u8> {
+    let mut v = vec![0u8; CHUNK_HEAD_SZ];
     v.extend_from_slice(b"WAVE");
-    v.extend_from_slice(b"fmt\0");
-    v.extend_from_slice(&(WAVE_FMT_SZ as u32).to_le_bytes());
-    v.resize(v.len() + WAVE_FMT_SZ, 0);
-    v.extend_from_slice(b"data");
-    v.extend_from_slice(&samples_sz.to_le_bytes());
-    v.resize(v.len() + (samples_sz as usize), 0);
-    v.resize(v.len() + (appendix_sz as usize), 0);
+    let mut riff_sz = 4u32;
+
+    for (head, payload) in chunk_heads {
+        v.extend_from_slice(&head.as_bytes()[..]);
+        let rsz = real_size(head.size);
+
+        match payload {
+            None => v.resize(v.len() + rsz as usize, 0u8),
+            Some(bytes) => v.extend_from_slice(*bytes),
+        }
+
+        riff_sz += rsz + CHUNK_HEAD_SZ as u32;
+    }
+
+    let riff_head = riff_head(riff_sz);
+    (&mut v[..8]).copy_from_slice(&riff_head.as_bytes()[..]);
+
     v
 }
 
 #[test]
-fn wave_cursor_read_seek() {
-    const SAMPLES_SZ: u32 = 88200;
-    const APPENDIX_SZ: u32 = 200;
-    const NEW_RIFF_SZ: u32 =
-        4 + SAMPLES_SZ + WAVE_FMT_SZ as u32 + 2 * RIFF_HEAD_SZ as u32;
-    let bytes = wave_bytes(SAMPLES_SZ, APPENDIX_SZ);
-    let mut base_cursor = io::Cursor::new(&bytes[..]);
-    let mut split = SplitCursor::new(&mut base_cursor).unwrap();
-    let mut wave_cursor = split.wave_cursor().unwrap();
-    let new_riff_sz_bytes = NEW_RIFF_SZ.to_le_bytes();
+fn get_cue_points() {
+    let cue1 = CuePoint::from_sample_offset(1, 20);
+    let cue2 = CuePoint::from_sample_offset(2, 200);
+    let mut cue_bytes = vec![2u8, 0, 0, 0];
+    cue_bytes.extend_from_slice(&cue1.as_bytes()[..]);
+    cue_bytes.extend_from_slice(&cue2.as_bytes()[..]);
+    let cue_head = ChunkHead {
+        tag: *b"cue ",
+        size: 4 + 2 * CUE_SZ as u32,
+    };
+    let fmt_head = ChunkHead {
+        tag: *b"fmt ",
+        size: 23,
+    };
+    let data_head = ChunkHead {
+        tag: *b"data",
+        size: 3001,
+    };
 
-    assert_eq!(wave_cursor.stream_position().unwrap(), 0);
+    let check_chunks = |chunks: &[(ChunkHead, Option<&[u8]>)]| {
+        let bytes = wave_bytes(&chunks[..]);
+        let mut base_cursor = io::Cursor::new(&bytes[..]);
+        let initial_position = base_cursor.stream_position().unwrap();
+        let mut cursor = WaveCursor::new(base_cursor).unwrap();
 
-    let mut trunc_bytes = [0u8; NEW_RIFF_SZ as usize + RIFF_HEAD_SZ];
-    wave_cursor.read_exact(&mut trunc_bytes).unwrap();
+        let chunk_bytes =
+            cursor.read_next_chunk_body(*b"cue ").unwrap().unwrap();
 
-    assert_eq!(&trunc_bytes[..4], b"RIFF");
-    assert_eq!(&trunc_bytes[4..8], &new_riff_sz_bytes);
-    assert_eq!(&trunc_bytes[8..12], b"WAVE");
+        let cue_points = parse_cue_points(&chunk_bytes[..]);
+        assert_eq!(cue_points[0], cue1);
+        assert_eq!(cue_points[1], cue2);
+        assert_eq!(cue_points.len(), 2);
+        let mut base_cursor = cursor.restore_cursor().unwrap();
+        assert_eq!(base_cursor.stream_position().unwrap(), initial_position);
+    };
 
-    let mut word = [0u8; 4];
-    let pos = wave_cursor
-        .seek(SeekFrom::Start(RIFF_HEAD_SZ as u64))
-        .unwrap();
-    wave_cursor.read_exact(&mut word).unwrap();
+    check_chunks(
+        &vec![
+            (fmt_head, None),
+            (data_head, None),
+            (cue_head, Some(&cue_bytes[..])),
+        ][..],
+    );
 
-    assert_eq!(pos, 8);
-    assert_eq!(&word, b"WAVE");
+    check_chunks(
+        &vec![
+            (fmt_head, None),
+            (cue_head, Some(&cue_bytes[..])),
+            (data_head, None),
+        ][..],
+    );
 
-    let pos = wave_cursor.seek(SeekFrom::Start(0)).unwrap();
-    wave_cursor.read_exact(&mut word).unwrap();
-
-    assert_eq!(pos, 0);
-    assert_eq!(&word, b"RIFF");
-
-    wave_cursor.read_exact(&mut word).unwrap();
-
-    assert_eq!(&word, &new_riff_sz_bytes);
-
-    wave_cursor.read_exact(&mut word).unwrap();
-
-    assert_eq!(&word, b"WAVE");
-
-    let mut dword = [0u8; 8];
-    let pos = wave_cursor.seek(SeekFrom::Current(-10)).unwrap();
-    wave_cursor.read_exact(&mut dword).unwrap();
-    let mut expected_dword = [0u8; 8];
-    expected_dword[0..2].copy_from_slice(b"FF");
-    expected_dword[2..6].copy_from_slice(&new_riff_sz_bytes);
-    expected_dword[6..8].copy_from_slice(b"WA");
-
-    assert_eq!(pos, 2);
-    assert_eq!(&dword, &expected_dword);
-    assert_eq!(wave_cursor.stream_position().unwrap(), 10);
-
-    let pos = wave_cursor.seek(SeekFrom::End(0)).unwrap();
-
-    assert_eq!(pos, (RIFF_HEAD_SZ as u64) + (NEW_RIFF_SZ as u64));
+    check_chunks(
+        &vec![
+            (cue_head, Some(&cue_bytes[..])),
+            (fmt_head, None),
+            (data_head, None),
+        ][..],
+    );
 }
 
 #[test]
-fn wave_cursor_end() {
-    const SAMPLES_SZ: u32 = 1024;
-    const APPENDIX_SZ: u32 = 2;
-    let bytes = wave_bytes(SAMPLES_SZ, APPENDIX_SZ);
-    let byte_ct = bytes.len();
-    let mut base_cursor = io::Cursor::new(&bytes[..]);
-    let mut split = SplitCursor::new(&mut base_cursor).unwrap();
-    let mut wave_cursor = split.wave_cursor().unwrap();
-    let mut buf = Vec::new();
-    let mut byte_buf = vec![0u8];
-    wave_cursor.read_to_end(&mut buf).unwrap();
-    let last_pos = wave_cursor.stream_position().unwrap();
-    let seek_end = wave_cursor.seek(SeekFrom::End(0)).unwrap();
-    assert_eq!(last_pos, seek_end);
-    let result = wave_cursor.read_exact(&mut byte_buf[..]);
+fn append_cue_points() {
+    let cue1 = CuePoint::from_sample_offset(1, 333);
+    let cue2 = CuePoint::from_sample_offset(2, 477);
+    let mut cue_bytes = vec![2u8, 0, 0, 0];
+    cue_bytes.extend_from_slice(&cue1.as_bytes()[..]);
+    cue_bytes.extend_from_slice(&cue2.as_bytes()[..]);
+    let cues = vec![cue1, cue2];
 
-    if let Ok(_) = result {
-        panic!("Wave cursor read result did not error");
-    }
+    let fmt_head = ChunkHead {
+        tag: *b"fmt ",
+        size: 33,
+    };
+
+    let data_head = ChunkHead {
+        tag: *b"data",
+        size: 1,
+    };
+
+    let initial_wave_bytes =
+        wave_bytes(&vec![(fmt_head, None), (data_head, None)]);
+
+    let mut wave_bytes = initial_wave_bytes.clone();
+
+    let cursor_end_position = {
+        let mut cursor = io::Cursor::new(&mut wave_bytes);
+        assert_eq!(cursor.stream_position().unwrap(), 0);
+        append_cue_chunk(&mut cursor, &cues[..]).unwrap();
+        cursor.stream_position().unwrap()
+    };
+
+    assert_eq!(wave_bytes[..4], initial_wave_bytes[..4],);
+
+    assert_eq!(
+        wave_bytes[8..initial_wave_bytes.len()],
+        initial_wave_bytes[8..],
+    );
+
+    assert_eq!(
+        u32::from_le_bytes(*wave_bytes[4..8].first_chunk().unwrap()) as usize,
+        u32::from_le_bytes(*initial_wave_bytes[4..8].first_chunk().unwrap())
+            as usize
+            + CHUNK_HEAD_SZ
+            + cue_bytes.len(),
+    );
+
+    let cue_start = initial_wave_bytes.len();
+
+    assert_eq!(
+        wave_bytes[cue_start..cue_start + CHUNK_HEAD_SZ],
+        ChunkHead {
+            tag: *b"cue ",
+            size: cue_bytes.len() as u32
+        }
+        .as_bytes()[..],
+    );
+
+    assert_eq!(wave_bytes[cue_start + CHUNK_HEAD_SZ..], cue_bytes[..]);
+
+    assert_eq!(cursor_end_position, wave_bytes.len() as u64,);
+    assert_eq!(
+        wave_bytes.len(),
+        initial_wave_bytes.len() + cue_bytes.len() + CHUNK_HEAD_SZ,
+    );
 }

@@ -1,7 +1,8 @@
-use io::{ErrorKind, Read, Seek, SeekFrom};
+use io::{Read, Seek, SeekFrom, Write};
 use std::io;
 
-const RIFF_HEAD_SZ: u64 = 8;
+pub const CHUNK_HEAD_SZ: usize = 8;
+pub const CUE_SZ: usize = 24;
 
 #[derive(Debug)]
 pub enum Error {
@@ -21,8 +22,8 @@ impl std::fmt::Display for Error {
         formatter: &mut std::fmt::Formatter<'_>,
     ) -> Result<(), std::fmt::Error> {
         match self {
-            Self::Wave(s) => writeln!(formatter, "Error: Wave: {}", s)?,
-            Self::Io(e) => writeln!(formatter, "Error: IO: {}", e)?,
+            Self::Wave(s) => writeln!(formatter, "Wave: {}", s)?,
+            Self::Io(e) => writeln!(formatter, "IO: {}", e)?,
         }
 
         Ok(())
@@ -37,194 +38,243 @@ impl From<io::Error> for Error {
 
 impl std::error::Error for Error {}
 
-#[derive(Debug)]
-pub struct WaveCursor<'a, Cursor: Read + Seek> {
-    head: [u8; RIFF_HEAD_SZ as usize],
-    end: u64,
-    base_cursor: &'a mut Cursor,
-    offset: u64,
-    position: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkHead {
+    pub tag: [u8; 4],
+    pub size: u32,
 }
 
-impl<'a, Cursor: Read + Seek> WaveCursor<'a, Cursor> {
-    fn new(riff_sz: u32, base_cursor: &'a mut Cursor) -> io::Result<Self> {
-        let offset = base_cursor.stream_position()?;
+impl ChunkHead {
+    pub fn parse(cursor: &mut impl Read) -> Result<Self, Error> {
+        let mut tag = [0u8; 4];
+        let mut size_bytes = [0u8; 4];
+        cursor.read_exact(&mut tag)?;
+        cursor.read_exact(&mut size_bytes)?;
+        let size = u32::from_le_bytes(size_bytes);
 
-        let mut head = [0u8; RIFF_HEAD_SZ as usize];
+        Ok(ChunkHead { tag, size })
+    }
 
-        (&b"RIFF"[..]).read_exact(&mut head[..4]).and_then(|_| {
-            (&riff_sz.to_le_bytes()[..]).read_exact(&mut head[4..])
-        })?;
+    pub fn tag(&self) -> [u8; 4] {
+        self.tag
+    }
 
-        let end = u64::from(riff_sz) + RIFF_HEAD_SZ;
+    pub fn size(&self) -> u32 {
+        self.size
+    }
+
+    pub fn as_bytes(&self) -> [u8; CHUNK_HEAD_SZ] {
+        let mut bytes = [0u8; CHUNK_HEAD_SZ];
+        bytes[..4].copy_from_slice(&self.tag[..]);
+        bytes[4..].copy_from_slice(&self.size.to_le_bytes()[..]);
+        bytes
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CuePoint {
+    pub id: u32,
+    pub position: u32,
+    pub data_tag: [u8; 4],
+    pub chunk_start: u32,
+    pub block_start: u32,
+    pub sample_offset: u32,
+}
+
+impl CuePoint {
+    fn parse(bytes: &[u8]) -> Self {
+        let next_array = |iter: &mut std::slice::ChunksExact<'_, u8>| {
+            *iter.next().unwrap().first_chunk::<4>().unwrap()
+        };
+
+        let next_int = |iter: &mut std::slice::ChunksExact<'_, u8>| {
+            u32::from_le_bytes(next_array(iter))
+        };
+
+        let mut chunks = bytes.chunks_exact(4);
+        let id = next_int(&mut chunks);
+        let position = next_int(&mut chunks);
+        let data_tag = next_array(&mut chunks);
+        let chunk_start = next_int(&mut chunks);
+        let block_start = next_int(&mut chunks);
+        let sample_offset = next_int(&mut chunks);
+
+        CuePoint {
+            id,
+            position,
+            data_tag,
+            chunk_start,
+            block_start,
+            sample_offset,
+        }
+    }
+
+    pub fn from_sample_offset(id: u32, offset: u32) -> Self {
+        CuePoint {
+            id,
+            position: 0,
+            data_tag: *b"data",
+            chunk_start: 0,
+            block_start: 0,
+            sample_offset: offset,
+        }
+    }
+
+    pub fn as_bytes(&self) -> [u8; CUE_SZ] {
+        let mut bytes = [0u8; CUE_SZ];
+        bytes[..4].copy_from_slice(&self.id.to_le_bytes()[..]);
+        bytes[4..8].copy_from_slice(&self.position.to_le_bytes()[..]);
+        bytes[8..12].copy_from_slice(&self.data_tag[..]);
+        bytes[12..16].copy_from_slice(&self.chunk_start.to_le_bytes()[..]);
+        bytes[16..20].copy_from_slice(&self.block_start.to_le_bytes()[..]);
+        bytes[20..].copy_from_slice(&self.sample_offset.to_le_bytes()[..]);
+        bytes
+    }
+}
+
+pub fn parse_cue_points(bytes: &[u8]) -> Vec<CuePoint> {
+    (bytes[4..])
+        .chunks_exact(CUE_SZ)
+        .map(CuePoint::parse)
+        .collect()
+}
+
+pub fn append_cue_chunk<Cursor: Read + Write + Seek>(
+    cursor: &mut Cursor,
+    cues: &[CuePoint],
+) -> Result<(), Error> {
+    let old_size = read_riff_head(cursor)?.size;
+    let riff_sz_position = cursor.stream_position()? - 8;
+
+    let chunk_size = cues
+        .len()
+        .checked_mul(CUE_SZ)
+        .and_then(|sz| sz.checked_add(4))
+        .and_then(|sz| u32::try_from(sz).ok())
+        .ok_or(Error::wave("Chunk size exceeds bounds of 32-bit integer"))?;
+
+    let new_size = chunk_size
+        .checked_add(CHUNK_HEAD_SZ as u32)
+        .and_then(|sz| sz.checked_add(old_size))
+        .ok_or(Error::wave(
+            "New RIFF size exceeds bounds of 32-bit integer",
+        ))?;
+
+    cursor.seek(SeekFrom::Start(riff_sz_position))?;
+    cursor.write_all(&new_size.to_le_bytes()[..])?;
+    cursor.seek(SeekFrom::Current(old_size.into()))?;
+
+    let chunk_head = ChunkHead {
+        tag: *b"cue ",
+        size: chunk_size,
+    };
+
+    cursor.write_all(&chunk_head.as_bytes()[..])?;
+    cursor.write_all(&(cues.len() as u32).to_le_bytes()[..])?;
+
+    for cue in cues {
+        cursor.write_all(&cue.as_bytes()[..])?;
+    }
+
+    Ok(())
+}
+
+fn read_riff_head<Cursor: Read + Seek>(
+    cursor: &mut Cursor,
+) -> Result<ChunkHead, Error> {
+    let mut wave_id = [0u8; 4];
+    let head = ChunkHead::parse(cursor)?;
+    cursor.read_exact(&mut wave_id)?;
+
+    if head.tag != *b"RIFF" || wave_id != *b"WAVE" {
+        return Err(Error::wave("Not a WAVE file"));
+    }
+
+    if head.size & 1 == 1 {
+        return Err(Error::wave("Malformed file: Odd RIFF size"));
+    }
+
+    Ok(head)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct WaveCursor<Cursor: Read + Seek> {
+    head: ChunkHead,
+    base_cursor: Cursor,
+    wave_start: u64,
+    wave_end: u64,
+    first_chunk_pos: u64,
+}
+
+impl<Cursor: Read + Seek> WaveCursor<Cursor> {
+    pub fn new(mut cursor: Cursor) -> Result<Self, Error> {
+        let wave_start = cursor.stream_position()?;
+        let head = read_riff_head(&mut cursor)?;
+        let first_chunk_pos = cursor.stream_position()?;
+        let wave_end = wave_start
+            .checked_add(CHUNK_HEAD_SZ.try_into().unwrap())
+            .and_then(|sz| sz.checked_add(head.size.into()))
+            .ok_or(Error::wave("WAVE size too large for file"))?;
 
         Ok(Self {
             head,
-            end,
-            base_cursor,
-            offset,
-            position: 0,
-        })
-    }
-}
-
-impl<'a, Cursor: Read + Seek> Seek for WaveCursor<'a, Cursor> {
-    fn seek(&mut self, seek_from: SeekFrom) -> io::Result<u64> {
-        let seek_err = io::Error::new(
-            ErrorKind::InvalidInput,
-            "attempted negative or overflowing seek",
-        );
-
-        match seek_from {
-            SeekFrom::Start(new_pos) => {
-                self.position = new_pos;
-            }
-            SeekFrom::Current(offset) => {
-                self.position =
-                    self.position.checked_add_signed(offset).ok_or(seek_err)?;
-            }
-            SeekFrom::End(end_offset) => {
-                self.position =
-                    self.end.checked_add_signed(end_offset).ok_or(seek_err)?;
-            }
-        }
-
-        Ok(self.position)
-    }
-}
-
-impl<'a, Cursor: Read + Seek> Read for WaveCursor<'a, Cursor> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let read_err = || {
-            io::Error::new(
-                ErrorKind::InvalidInput,
-                "attempted to read beyond bounds",
-            )
-        };
-
-        let read_start = self.position.max(RIFF_HEAD_SZ);
-
-        let head_bytes =
-            usize::try_from(RIFF_HEAD_SZ.saturating_sub(self.position))
-                .unwrap()
-                .min(buf.len());
-
-        let max_read_ct = buf.len().min(
-            usize::try_from(self.end.saturating_sub(self.position))
-                .map_err(|_| read_err())?,
-        );
-
-        let head_start =
-            usize::try_from(self.position.min(RIFF_HEAD_SZ)).unwrap();
-
-        let head_end = head_start + head_bytes;
-        let bytes_to_read = buf.len().saturating_sub(head_bytes);
-        let read_end = head_end.checked_add(bytes_to_read).ok_or(read_err())?;
-
-        buf[..head_bytes].copy_from_slice(&self.head[head_start..head_end]);
-
-        let read_bytes = read_start
-            .checked_add(self.offset)
-            .ok_or(read_err())
-            .and_then(|start| self.base_cursor.seek(SeekFrom::Start(start)))
-            .and_then(|_| {
-                self.base_cursor.read(&mut buf[head_bytes..max_read_ct])
-            })?;
-
-        let total_bytes =
-            read_bytes.checked_add(head_bytes).ok_or(read_err())?;
-
-        self.position = self
-            .position
-            .checked_add(total_bytes.try_into().map_err(|_| read_err())?)
-            .ok_or(read_err())?;
-
-        Ok(total_bytes)
-    }
-}
-
-#[derive(Debug)]
-pub struct SplitCursor<'a, Cursor: Read + Seek> {
-    base_cursor: &'a mut Cursor,
-    wave_start: u64,
-    wave_sz: u32,
-    appendix_start: u64,
-}
-
-impl<'a, Cursor: Read + Seek> SplitCursor<'a, Cursor> {
-    pub fn new(cursor: &'a mut Cursor) -> Result<Self, Error> {
-        let mut riff_id = [0u8; 4];
-        let mut riff_sz = [0u8; 4]; // unused
-        let mut wave_id = [0u8; 4];
-        let mut fmt_id = [0u8; 4];
-        let mut fmt_sz = [0u8; 4];
-        let mut data_id = [0u8; 4];
-        let mut data_sz = [0u8; 4];
-
-        let wave_start = cursor.stream_position().map_err(Error::Io)?;
-
-        cursor
-            .read_exact(&mut riff_id)
-            .and_then(|_| cursor.read_exact(&mut riff_sz))
-            .and_then(|_| cursor.read_exact(&mut wave_id))
-            .and_then(|_| cursor.read_exact(&mut fmt_id))
-            .and_then(|_| cursor.read_exact(&mut fmt_sz))
-            .map_err(Error::Io)?;
-
-        if riff_id != *b"RIFF" || wave_id != *b"WAVE" {
-            return Err(Error::wave("Not a WAVE file"));
-        }
-
-        if fmt_id != *b"fmt\0" {
-            return Err(Error::wave("Malformed WAVE file: Missing \"fmt\""));
-        }
-
-        let fmt_sz = u32::from_le_bytes(fmt_sz);
-
-        cursor
-            .seek(SeekFrom::Current(fmt_sz.into()))
-            .map_err(Error::Io)?;
-
-        cursor
-            .read_exact(&mut data_id)
-            .and_then(|_| cursor.read_exact(&mut data_sz))
-            .map_err(Error::Io)?;
-
-        if data_id != *b"data" {
-            return Err(Error::wave(format!(
-                "Malformed WAVE file: Expected \"data\" got {:?}",
-                data_id,
-            )));
-        }
-
-        let data_sz = u32::from_le_bytes(data_sz);
-
-        let appendix_start = cursor
-            .stream_position()
-            .map_err(Error::Io)?
-            .checked_add(data_sz.into())
-            .unwrap();
-
-        let new_wave_sz = appendix_start - wave_start - RIFF_HEAD_SZ;
-        let new_wave_sz: u32 = new_wave_sz.try_into().map_err(Error::wave)?;
-
-        Ok(Self {
             base_cursor: cursor,
             wave_start,
-            wave_sz: new_wave_sz,
-            appendix_start,
+            wave_end,
+            first_chunk_pos,
         })
     }
 
-    pub fn appendix_cursor(&mut self) -> Result<&mut Cursor, io::Error> {
+    pub fn reset(&mut self) -> Result<(), Error> {
         self.base_cursor
-            .seek(SeekFrom::Start(self.appendix_start))?;
+            .seek(SeekFrom::Start(self.first_chunk_pos))
+            .map(|_| ())
+            .map_err(Error::Io)
+    }
+
+    pub fn restore_cursor(mut self) -> Result<Cursor, Error> {
+        self.base_cursor.seek(SeekFrom::Start(self.wave_start))?;
         Ok(self.base_cursor)
     }
 
-    pub fn wave_cursor(&mut self) -> Result<WaveCursor<Cursor>, io::Error> {
-        self.base_cursor.seek(SeekFrom::Start(self.wave_start))?;
-        WaveCursor::new(self.wave_sz, self.base_cursor)
+    pub fn read_next_chunk_body(
+        &mut self,
+        tag: [u8; 4],
+    ) -> Result<Option<Vec<u8>>, Error> {
+        let current_position = |curs: &mut Cursor| curs.stream_position();
+
+        let mut body = None;
+
+        while current_position(&mut self.base_cursor)? < self.wave_end
+            && body.is_none()
+        {
+            let chunk_head = ChunkHead::parse(&mut self.base_cursor)?;
+            let size = chunk_head.size();
+
+            if chunk_head.tag == tag {
+                let mut buffer = vec![
+                    0u8;
+                    usize::try_from(size).map_err(|_| {
+                        Error::wave(format!(
+                            "Chunk size {} too large for platform",
+                            size
+                        ))
+                    })?
+                ];
+
+                self.base_cursor.read_exact(&mut buffer[..])?;
+
+                body = Some(buffer);
+            } else {
+                self.base_cursor.seek(SeekFrom::Current(size.into()))?;
+            }
+
+            if chunk_head.size & 1 == 1 {
+                self.base_cursor.seek(SeekFrom::Current(1))?;
+            }
+        }
+
+        Ok(body)
     }
 }
 

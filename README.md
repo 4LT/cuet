@@ -7,4 +7,7 @@ Snagging this sweet crate name before some name-squatter does
 
 0.0.3:
 * Correct version of previous changes in changelog
-* Add tests for reading beyond limit + appropriate fixes for failing tests
+* Rewrite from scratch
+* Implement reading cue chunks and parsing cue points from said chunks
+* Implement appending cue chunks to existing WAVE files
+
