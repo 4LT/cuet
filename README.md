@@ -11,3 +11,5 @@ Snagging this sweet crate name before some name-squatter does
 * Implement reading cue chunks and parsing cue points from said chunks
 * Implement appending cue chunks to existing WAVE files
 
+0.0.4:
+* Make tag argument option on reading chunks, return tag with chunk (breaking)

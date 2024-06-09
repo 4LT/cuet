@@ -237,21 +237,21 @@ impl<Cursor: Read + Seek> WaveCursor<Cursor> {
         Ok(self.base_cursor)
     }
 
-    pub fn read_next_chunk_body(
+    pub fn read_next_chunk(
         &mut self,
-        tag: [u8; 4],
-    ) -> Result<Option<Vec<u8>>, Error> {
+        tag: Option<[u8; 4]>,
+    ) -> Result<Option<([u8; 4], Vec<u8>)>, Error> {
         let current_position = |curs: &mut Cursor| curs.stream_position();
 
-        let mut body = None;
+        let mut chunk = None;
 
         while current_position(&mut self.base_cursor)? < self.wave_end
-            && body.is_none()
+            && chunk.is_none()
         {
             let chunk_head = ChunkHead::parse(&mut self.base_cursor)?;
             let size = chunk_head.size();
 
-            if chunk_head.tag == tag {
+            if tag.is_none() || Some(chunk_head.tag) == tag {
                 let mut buffer = vec![
                     0u8;
                     usize::try_from(size).map_err(|_| {
@@ -264,7 +264,7 @@ impl<Cursor: Read + Seek> WaveCursor<Cursor> {
 
                 self.base_cursor.read_exact(&mut buffer[..])?;
 
-                body = Some(buffer);
+                chunk = Some((chunk_head.tag, buffer));
             } else {
                 self.base_cursor.seek(SeekFrom::Current(size.into()))?;
             }
@@ -274,7 +274,7 @@ impl<Cursor: Read + Seek> WaveCursor<Cursor> {
             }
         }
 
-        Ok(body)
+        Ok(chunk)
     }
 }
 

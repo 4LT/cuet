@@ -69,8 +69,8 @@ fn get_cue_points() {
         let initial_position = base_cursor.stream_position().unwrap();
         let mut cursor = WaveCursor::new(base_cursor).unwrap();
 
-        let chunk_bytes =
-            cursor.read_next_chunk_body(*b"cue ").unwrap().unwrap();
+        let (_, chunk_bytes) =
+            cursor.read_next_chunk(Some(*b"cue ")).unwrap().unwrap();
 
         let cue_points = parse_cue_points(&chunk_bytes[..]);
         assert_eq!(cue_points[0], cue1);

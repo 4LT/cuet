@@ -17,18 +17,19 @@ fn main() {
     let mut wave_cursor = WaveCursor::new(reader).unwrap();
 
     let sample_byte_ct = wave_cursor
-        .read_next_chunk_body(*b"data")
+        .read_next_chunk(Some(*b"data"))
         .unwrap()
         .unwrap()
+        .1
         .len();
 
     println!("Found {sample_byte_ct} bytes of samples");
 
     wave_cursor.reset().unwrap();
 
-    let cue_body = wave_cursor.read_next_chunk_body(*b"cue ").unwrap();
+    let cue_body = wave_cursor.read_next_chunk(Some(*b"cue ")).unwrap();
 
-    if let Some(payload) = cue_body {
+    if let Some((_, payload)) = cue_body {
         let cue_points = parse_cue_points(&payload[..]);
         println!("{} cue points found", cue_points.len());
 
