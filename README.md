@@ -13,3 +13,6 @@ Snagging this sweet crate name before some name-squatter does
 
 0.0.4:
 * Make tag argument option on reading chunks, return tag with chunk (breaking)
+
+0.0.5:
+* Support reading and writing LIST chunks w/ labeled text "ltxt" sub-chunks
