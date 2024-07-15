@@ -1,4 +1,4 @@
-use cuet::{parse_cue_points, WaveCursor};
+use cuet::WaveCursor;
 use std::env::args;
 use std::fs::File;
 use std::io;
@@ -34,6 +34,17 @@ fn main() {
                 let sctype_s =
                     sctype.iter().map(|&b| b as char).collect::<String>();
                 println!("\tSub-chunk type = \"{}\"", sctype_s);
+
+                let sclen = u32::from_le_bytes(
+                    *chunk[8..12]
+                        .chunks_exact(4)
+                        .next()
+                        .unwrap()
+                        .first_chunk::<4>()
+                        .unwrap(),
+                ) as usize;
+
+                println!("\tSub-chunk length: {}", sclen);
             }
         }
     }

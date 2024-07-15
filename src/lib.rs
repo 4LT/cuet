@@ -3,6 +3,10 @@ use std::io;
 
 pub const CHUNK_HEAD_SZ: usize = 8;
 pub const CUE_SZ: usize = 24;
+pub const LABELED_TEXT_MIN_SZ: usize = 20;
+pub const CHUNK_TOO_BIG: &str = "Chunk size exceeds bounds of 32-bit integer";
+
+pub type ChunkDefinition = ([u8; 4], Vec<u8>);
 
 #[derive(Debug)]
 pub enum Error {
@@ -71,6 +75,103 @@ impl ChunkHead {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LabeledText {
+    pub cue_id: u32,
+    pub sample_length: u32,
+    pub purpose_id: [u8; 4],
+    pub country: [u8; 2],
+    pub language: [u8; 2],
+    pub dialect: [u8; 2],
+    pub code_page: u16,
+    pub text: String,
+}
+
+impl LabeledText {
+    // bytes length must be >= LABELED_TEXT_MIN_SZ
+    fn parse(bytes: &[u8]) -> Self {
+        let next_u32 = |iter: &mut std::slice::Iter<'_, u8>| {
+            let u32_bytes = [
+                *iter.next().unwrap(),
+                *iter.next().unwrap(),
+                *iter.next().unwrap(),
+                *iter.next().unwrap(),
+            ];
+            u32::from_le_bytes(u32_bytes)
+        };
+
+        let next_u16 = |iter: &mut std::slice::Iter<'_, u8>| {
+            let u16_bytes = [*iter.next().unwrap(), *iter.next().unwrap()];
+            u16::from_le_bytes(u16_bytes)
+        };
+
+        let mut iter = bytes.iter();
+
+        let cue_id = next_u32(&mut iter);
+        let sample_length = next_u32(&mut iter);
+
+        let purpose_id = [
+            *iter.next().unwrap(),
+            *iter.next().unwrap(),
+            *iter.next().unwrap(),
+            *iter.next().unwrap(),
+        ];
+
+        let country = [*iter.next().unwrap(), *iter.next().unwrap()];
+
+        let language = [*iter.next().unwrap(), *iter.next().unwrap()];
+
+        let dialect = [*iter.next().unwrap(), *iter.next().unwrap()];
+
+        let code_page = next_u16(&mut iter);
+
+        let text =
+            String::from_utf8_lossy(&iter.copied().collect::<Vec<u8>>()[..])
+                .to_string();
+
+        LabeledText {
+            cue_id,
+            sample_length,
+            purpose_id,
+            country,
+            language,
+            dialect,
+            code_page,
+            text,
+        }
+    }
+
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let mut text_bytes = Vec::from(self.text.as_bytes());
+        let mut bytes =
+            Vec::<u8>::with_capacity(LABELED_TEXT_MIN_SZ + text_bytes.len());
+
+        bytes.extend_from_slice(&self.cue_id.to_le_bytes());
+        bytes.extend_from_slice(&self.sample_length.to_le_bytes());
+        bytes.extend_from_slice(&self.purpose_id);
+        bytes.extend_from_slice(&self.country);
+        bytes.extend_from_slice(&self.language);
+        bytes.extend_from_slice(&self.dialect);
+        bytes.extend_from_slice(&self.code_page.to_le_bytes());
+        bytes.append(&mut text_bytes);
+
+        bytes
+    }
+
+    pub fn from_cue_length(cue_id: u32, sample_length: u32) -> LabeledText {
+        LabeledText {
+            cue_id,
+            sample_length,
+            purpose_id: *b"mark",
+            country: *b"  ",
+            language: *b"  ",
+            dialect: *b"  ",
+            code_page: 0,
+            text: String::from(""),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CuePoint {
     pub id: u32,
@@ -82,6 +183,7 @@ pub struct CuePoint {
 }
 
 impl CuePoint {
+    // bytes length must be CUE_SZ long
     fn parse(bytes: &[u8]) -> Self {
         let next_array = |iter: &mut std::slice::ChunksExact<'_, u8>| {
             *iter.next().unwrap().first_chunk::<4>().unwrap()
@@ -139,6 +241,41 @@ pub fn parse_cue_points(bytes: &[u8]) -> Vec<CuePoint> {
         .collect()
 }
 
+pub fn extract_labeled_text_from_list(bytes: &[u8]) -> Vec<LabeledText> {
+    let mut labeled_texts = vec![];
+
+    if bytes.len() < 4 {
+        return labeled_texts;
+    }
+
+    let mut slice = &bytes[4..];
+
+    while slice.len() >= 8 {
+        let mut sub_chunk_len = [0u8; 4];
+
+        sub_chunk_len.copy_from_slice(&slice[4..8]);
+        let sub_chunk_len = u32::from_le_bytes(sub_chunk_len) as usize;
+        let sub_chunk_tag = slice[..4].chunks(4).next().unwrap();
+        slice = &slice[8..];
+
+        if &sub_chunk_tag == b"ltxt"
+            && sub_chunk_len >= LABELED_TEXT_MIN_SZ
+            && slice.len() >= sub_chunk_len
+        {
+            let sub_chunk = &slice[..sub_chunk_len];
+            labeled_texts.push(LabeledText::parse(sub_chunk));
+        }
+
+        slice = &slice[sub_chunk_len.min(slice.len())..];
+
+        if sub_chunk_len & 1 == 1 && !slice.is_empty() {
+            slice = &slice[1..];
+        }
+    }
+
+    labeled_texts
+}
+
 pub fn append_cue_chunk<Cursor: Read + Write + Seek>(
     cursor: &mut Cursor,
     cues: &[CuePoint],
@@ -151,14 +288,12 @@ pub fn append_cue_chunk<Cursor: Read + Write + Seek>(
         .checked_mul(CUE_SZ)
         .and_then(|sz| sz.checked_add(4))
         .and_then(|sz| u32::try_from(sz).ok())
-        .ok_or(Error::wave("Chunk size exceeds bounds of 32-bit integer"))?;
+        .ok_or(Error::wave(CHUNK_TOO_BIG))?;
 
     let new_size = chunk_size
         .checked_add(CHUNK_HEAD_SZ as u32)
         .and_then(|sz| sz.checked_add(old_size))
-        .ok_or(Error::wave(
-            "New RIFF size exceeds bounds of 32-bit integer",
-        ))?;
+        .ok_or(Error::wave(CHUNK_TOO_BIG))?;
 
     cursor.seek(SeekFrom::Start(riff_sz_position))?;
     cursor.write_all(&new_size.to_le_bytes()[..])?;
@@ -174,6 +309,65 @@ pub fn append_cue_chunk<Cursor: Read + Write + Seek>(
 
     for cue in cues {
         cursor.write_all(&cue.as_bytes()[..])?;
+    }
+
+    Ok(())
+}
+
+pub fn append_label_chunk<Cursor: Read + Write + Seek>(
+    cursor: &mut Cursor,
+    labeled_texts: &[LabeledText],
+) -> Result<(), Error> {
+    let old_size = read_riff_head(cursor)?.size;
+    let riff_sz_position = cursor.stream_position()? - 8;
+
+    let chunk_size = labeled_texts
+        .iter()
+        .map(|ltxt| {
+            pad_size_16(ltxt.text.len())
+                .and_then(|sz| sz.checked_add(LABELED_TEXT_MIN_SZ))
+        })
+        .try_fold(0usize, |accum, element| {
+            element
+                .and_then(|sz| sz.checked_add(accum))
+                .and_then(|sum| sum.checked_add(CHUNK_HEAD_SZ))
+        })
+        .and_then(|sz| sz.checked_add(4usize))
+        .and_then(|sz| u32::try_from(sz).ok())
+        .ok_or(Error::wave(CHUNK_TOO_BIG))?;
+
+    let new_size = chunk_size
+        .checked_add(CHUNK_HEAD_SZ as u32)
+        .and_then(|sz| sz.checked_add(old_size))
+        .ok_or(Error::wave(CHUNK_TOO_BIG))?;
+
+    cursor.seek(SeekFrom::Start(riff_sz_position))?;
+    cursor.write_all(&new_size.to_le_bytes()[..])?;
+    cursor.seek(SeekFrom::Current(old_size.into()))?;
+
+    let chunk_head = ChunkHead {
+        tag: *b"LIST",
+        size: chunk_size,
+    };
+
+    cursor.write_all(&chunk_head.as_bytes()[..])?;
+    cursor.write_all(b"adtl")?;
+
+    for ltxt in labeled_texts {
+        let sub_chunk_sz =
+            u32::try_from(ltxt.text.len() + LABELED_TEXT_MIN_SZ).unwrap();
+
+        let sub_chunk_head = ChunkHead {
+            tag: *b"ltxt",
+            size: sub_chunk_sz,
+        };
+
+        cursor.write_all(&sub_chunk_head.as_bytes()[..])?;
+        cursor.write_all(&ltxt.as_bytes()[..])?;
+
+        if sub_chunk_sz & 1 == 1 {
+            cursor.write_all(&[0])?;
+        }
     }
 
     Ok(())
@@ -195,6 +389,14 @@ fn read_riff_head<Cursor: Read + Seek>(
     }
 
     Ok(head)
+}
+
+fn pad_size_16(size: usize) -> Option<usize> {
+    if size & 1 == 1 {
+        size.checked_add(1)
+    } else {
+        Some(size)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -240,7 +442,7 @@ impl<Cursor: Read + Seek> WaveCursor<Cursor> {
     pub fn read_next_chunk(
         &mut self,
         tag: Option<[u8; 4]>,
-    ) -> Result<Option<([u8; 4], Vec<u8>)>, Error> {
+    ) -> Result<Option<ChunkDefinition>, Error> {
         let current_position = |curs: &mut Cursor| curs.stream_position();
 
         let mut chunk = None;
