@@ -1,4 +1,4 @@
-use cuet::{parse_cue_points, WaveCursor};
+use cuet::{extract_labeled_text_from_list, parse_cue_points, WaveCursor};
 use std::env::args;
 use std::fs::File;
 use std::io;
@@ -28,6 +28,7 @@ fn main() {
     wave_cursor.reset().unwrap();
 
     let cue_body = wave_cursor.read_next_chunk(Some(*b"cue ")).unwrap();
+    let list_body = wave_cursor.read_next_chunk(Some(*b"LIST")).unwrap();
 
     if let Some((_, payload)) = cue_body {
         let cue_points = parse_cue_points(&payload[..]);
@@ -43,5 +44,24 @@ fn main() {
         }
     } else {
         println!("Cue chunk NOT found");
+    }
+
+    let list = list_body.and_then(|(_, payload)| {
+        let ltxts = extract_labeled_text_from_list(&payload);
+
+        if ltxts.is_empty() {
+            None
+        } else {
+            Some(ltxts)
+        }
+    });
+
+    if let Some(ltxts) = list {
+        println!("{} labeled text cue desc. sub-chunks found", ltxts.len());
+        for ltxt in ltxts {
+            println!("\tcue {} has length {}", ltxt.cue_id, ltxt.sample_length);
+        }
+    } else {
+        println!("Labeled text sub-chunk NOT found");
     }
 }
