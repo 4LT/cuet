@@ -276,103 +276,6 @@ pub fn extract_labeled_text_from_list(bytes: &[u8]) -> Vec<LabeledText> {
     labeled_texts
 }
 
-pub fn append_cue_chunk<Cursor: Read + Write + Seek>(
-    cursor: &mut Cursor,
-    cues: &[CuePoint],
-) -> Result<(), Error> {
-    let old_size = read_riff_head(cursor)?.size;
-    let riff_sz_position = cursor.stream_position()? - 8;
-
-    let chunk_size = cues
-        .len()
-        .checked_mul(CUE_SZ)
-        .and_then(|sz| sz.checked_add(4))
-        .and_then(|sz| u32::try_from(sz).ok())
-        .ok_or(Error::wave(CHUNK_TOO_BIG))?;
-
-    let new_size = chunk_size
-        .checked_add(CHUNK_HEAD_SZ as u32)
-        .and_then(|sz| sz.checked_add(old_size))
-        .ok_or(Error::wave(CHUNK_TOO_BIG))?;
-
-    cursor.seek(SeekFrom::Start(riff_sz_position))?;
-    cursor.write_all(&new_size.to_le_bytes()[..])?;
-    cursor.seek(SeekFrom::Current(old_size.into()))?;
-
-    let chunk_head = ChunkHead {
-        tag: *b"cue ",
-        size: chunk_size,
-    };
-
-    cursor.write_all(&chunk_head.as_bytes()[..])?;
-    cursor.write_all(&(cues.len() as u32).to_le_bytes()[..])?;
-
-    for cue in cues {
-        cursor.write_all(&cue.as_bytes()[..])?;
-    }
-
-    Ok(())
-}
-
-pub fn append_label_chunk<Cursor: Read + Write + Seek>(
-    cursor: &mut Cursor,
-    labeled_texts: &[LabeledText],
-) -> Result<(), Error> {
-    let old_size = read_riff_head(cursor)?.size;
-    let riff_sz_position = cursor.stream_position()? - 8;
-
-    let chunk_size = labeled_texts
-        .iter()
-        .map(|ltxt| {
-            pad_size_16(ltxt.text.len())
-                .and_then(|sz| sz.checked_add(LABELED_TEXT_MIN_SZ))
-        })
-        .try_fold(0usize, |accum, element| {
-            element
-                .and_then(|sz| sz.checked_add(accum))
-                .and_then(|sum| sum.checked_add(CHUNK_HEAD_SZ))
-        })
-        .and_then(|sz| sz.checked_add(4usize))
-        .and_then(|sz| u32::try_from(sz).ok())
-        .ok_or(Error::wave(CHUNK_TOO_BIG))?;
-
-    let new_size = chunk_size
-        .checked_add(CHUNK_HEAD_SZ as u32)
-        .and_then(|sz| sz.checked_add(old_size))
-        .ok_or(Error::wave(CHUNK_TOO_BIG))?;
-
-    cursor.seek(SeekFrom::Start(riff_sz_position))?;
-    cursor.write_all(&new_size.to_le_bytes()[..])?;
-    cursor.seek(SeekFrom::Current(old_size.into()))?;
-
-    let chunk_head = ChunkHead {
-        tag: *b"LIST",
-        size: chunk_size,
-    };
-
-    cursor.write_all(&chunk_head.as_bytes()[..])?;
-    cursor.write_all(b"adtl")?;
-
-    for ltxt in labeled_texts {
-        let sub_chunk_sz =
-            u32::try_from(ltxt.text.len() + LABELED_TEXT_MIN_SZ).unwrap();
-
-        let sub_chunk_head = ChunkHead {
-            tag: *b"ltxt",
-            size: sub_chunk_sz,
-        };
-
-        cursor.write_all(&sub_chunk_head.as_bytes()[..])?;
-        cursor.write_all(&ltxt.as_bytes()[..])?;
-
-        if sub_chunk_sz & 1 == 1 {
-            cursor.write_all(&[0])?;
-        }
-    }
-
-    Ok(())
-}
-
 fn read_riff_head<Cursor: Read + Seek>(
     cursor: &mut Cursor,
 ) -> Result<ChunkHead, Error> {
@@ -400,7 +303,7 @@ fn pad_size_16(size: usize) -> Option<usize> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub struct WaveCursor<Cursor: Read + Seek> {
+pub struct ChunkReader<Cursor: Read + Seek> {
     head: ChunkHead,
     base_cursor: Cursor,
     wave_start: u64,
@@ -408,7 +311,7 @@ pub struct WaveCursor<Cursor: Read + Seek> {
     first_chunk_pos: u64,
 }
 
-impl<Cursor: Read + Seek> WaveCursor<Cursor> {
+impl<Cursor: Read + Seek> ChunkReader<Cursor> {
     pub fn new(mut cursor: Cursor) -> Result<Self, Error> {
         let wave_start = cursor.stream_position()?;
         let head = read_riff_head(&mut cursor)?;
@@ -477,6 +380,136 @@ impl<Cursor: Read + Seek> WaveCursor<Cursor> {
         }
 
         Ok(chunk)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChunkWriter<Cursor: Read + Write + Seek> {
+    base_cursor: Cursor,
+    wave_start: u64,
+    wave_end: u64,
+}
+
+impl<Cursor: Read + Write + Seek> ChunkWriter<Cursor> {
+    pub fn new(mut cursor: Cursor) -> Result<Self, Error> {
+        let wave_start = cursor.stream_position()?;
+        let head = read_riff_head(&mut cursor)?;
+        let wave_end = wave_start
+            .checked_add(CHUNK_HEAD_SZ.try_into().unwrap())
+            .and_then(|sz| sz.checked_add(head.size.into()))
+            .ok_or(Error::wave("WAVE size too large for file"))?;
+
+        Ok(Self {
+            base_cursor: cursor,
+            wave_start,
+            wave_end,
+        })
+    }
+
+    pub fn restore_cursor(mut self) -> Result<Cursor, Error> {
+        self.base_cursor.seek(SeekFrom::Start(self.wave_start))?;
+        Ok(self.base_cursor)
+    }
+
+    pub fn append_cue_chunk(
+        &mut self,
+        cues: &[CuePoint],
+    ) -> Result<(), Error> {
+        let cursor = &mut self.base_cursor;
+        cursor.seek(SeekFrom::Start(self.wave_start))?;
+        let old_size = read_riff_head(cursor)?.size;
+        let riff_sz_position = cursor.stream_position()? - 8;
+
+        let chunk_size = cues
+            .len()
+            .checked_mul(CUE_SZ)
+            .and_then(|sz| sz.checked_add(4))
+            .and_then(|sz| u32::try_from(sz).ok())
+            .ok_or(Error::wave(CHUNK_TOO_BIG))?;
+
+        let new_size = chunk_size
+            .checked_add(CHUNK_HEAD_SZ as u32)
+            .and_then(|sz| sz.checked_add(old_size))
+            .ok_or(Error::wave(CHUNK_TOO_BIG))?;
+
+        cursor.seek(SeekFrom::Start(riff_sz_position))?;
+        cursor.write_all(&new_size.to_le_bytes()[..])?;
+        cursor.seek(SeekFrom::Current(old_size.into()))?;
+
+        let chunk_head = ChunkHead {
+            tag: *b"cue ",
+            size: chunk_size,
+        };
+
+        cursor.write_all(&chunk_head.as_bytes()[..])?;
+        cursor.write_all(&(cues.len() as u32).to_le_bytes()[..])?;
+
+        for cue in cues {
+            cursor.write_all(&cue.as_bytes()[..])?;
+        }
+
+        Ok(())
+    }
+
+    pub fn append_label_chunk(
+        &mut self,
+        labeled_texts: &[LabeledText],
+    ) -> Result<(), Error> {
+        let cursor = &mut self.base_cursor;
+        cursor.seek(SeekFrom::Start(self.wave_start))?;
+        let old_size = read_riff_head(cursor)?.size;
+        let riff_sz_position = cursor.stream_position()? - 8;
+
+        let chunk_size = labeled_texts
+            .iter()
+            .map(|ltxt| {
+                pad_size_16(ltxt.text.len())
+                    .and_then(|sz| sz.checked_add(LABELED_TEXT_MIN_SZ))
+            })
+            .try_fold(0usize, |accum, element| {
+                element
+                    .and_then(|sz| sz.checked_add(accum))
+                    .and_then(|sum| sum.checked_add(CHUNK_HEAD_SZ))
+            })
+            .and_then(|sz| sz.checked_add(4usize))
+            .and_then(|sz| u32::try_from(sz).ok())
+            .ok_or(Error::wave(CHUNK_TOO_BIG))?;
+
+        let new_size = chunk_size
+            .checked_add(CHUNK_HEAD_SZ as u32)
+            .and_then(|sz| sz.checked_add(old_size))
+            .ok_or(Error::wave(CHUNK_TOO_BIG))?;
+
+        cursor.seek(SeekFrom::Start(riff_sz_position))?;
+        cursor.write_all(&new_size.to_le_bytes()[..])?;
+        cursor.seek(SeekFrom::Current(old_size.into()))?;
+
+        let chunk_head = ChunkHead {
+            tag: *b"LIST",
+            size: chunk_size,
+        };
+
+        cursor.write_all(&chunk_head.as_bytes()[..])?;
+        cursor.write_all(b"adtl")?;
+
+        for ltxt in labeled_texts {
+            let sub_chunk_sz =
+                u32::try_from(ltxt.text.len() + LABELED_TEXT_MIN_SZ).unwrap();
+
+            let sub_chunk_head = ChunkHead {
+                tag: *b"ltxt",
+                size: sub_chunk_sz,
+            };
+
+            cursor.write_all(&sub_chunk_head.as_bytes()[..])?;
+            cursor.write_all(&ltxt.as_bytes()[..])?;
+
+            if sub_chunk_sz & 1 == 1 {
+                cursor.write_all(&[0])?;
+            }
+        }
+
+        Ok(())
     }
 }
 

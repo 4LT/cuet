@@ -16,3 +16,7 @@ Snagging this sweet crate name before some name-squatter does
 
 0.0.5:
 * Support reading and writing LIST chunks w/ labeled text "ltxt" sub-chunks
+
+0.0.6:
+* Rename WaveCursor to ChunkReader (breaking)
+* Refactor chunk-appending API into object-oriented style (breaking)

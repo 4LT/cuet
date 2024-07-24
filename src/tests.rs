@@ -1,9 +1,9 @@
 use crate::{
-    append_cue_chunk, append_label_chunk, extract_labeled_text_from_list,
-    parse_cue_points, ChunkHead, CuePoint, LabeledText, WaveCursor,
-    CHUNK_HEAD_SZ, CUE_SZ,
+    extract_labeled_text_from_list,
+    parse_cue_points, ChunkHead, CuePoint, LabeledText, ChunkReader,
+    ChunkWriter, CHUNK_HEAD_SZ, CUE_SZ,
 };
-use io::{Seek, SeekFrom};
+use io::Seek;
 use std::io;
 
 fn riff_head(size: u32) -> ChunkHead {
@@ -68,7 +68,7 @@ fn get_cue_points() {
         let bytes = wave_bytes(chunks);
         let mut base_cursor = io::Cursor::new(&bytes[..]);
         let initial_position = base_cursor.stream_position().unwrap();
-        let mut cursor = WaveCursor::new(base_cursor).unwrap();
+        let mut cursor = ChunkReader::new(base_cursor).unwrap();
 
         let (_, chunk_bytes) =
             cursor.read_next_chunk(Some(*b"cue ")).unwrap().unwrap();
@@ -128,12 +128,12 @@ fn append_cue_points() {
     let initial_wave_bytes = wave_bytes(&[(fmt_head, None), (data_head, None)]);
     let mut wave_bytes = initial_wave_bytes.clone();
 
-    let cursor_end_position = {
-        let mut cursor = io::Cursor::new(&mut wave_bytes);
-        assert_eq!(cursor.stream_position().unwrap(), 0);
-        append_cue_chunk(&mut cursor, &cues[..]).unwrap();
-        cursor.stream_position().unwrap()
-    };
+    let mut cursor = io::Cursor::new(&mut wave_bytes);
+    assert_eq!(cursor.stream_position().unwrap(), 0);
+    let mut writer = ChunkWriter::new(cursor).unwrap();
+    writer.append_cue_chunk(&cues[..]).unwrap();
+    cursor = writer.restore_cursor().unwrap();
+    assert_eq!(cursor.stream_position().unwrap(), 0);
 
     assert_eq!(wave_bytes[..4], initial_wave_bytes[..4],);
 
@@ -163,7 +163,6 @@ fn append_cue_points() {
 
     assert_eq!(wave_bytes[cue_start + CHUNK_HEAD_SZ..], cue_bytes[..]);
 
-    assert_eq!(cursor_end_position, wave_bytes.len() as u64,);
     assert_eq!(
         wave_bytes.len(),
         initial_wave_bytes.len() + cue_bytes.len() + CHUNK_HEAD_SZ,
@@ -207,7 +206,7 @@ fn get_labeled_text() {
 
     let bytes = wave_bytes(&chunks[..]);
     let base_cursor = io::Cursor::new(&bytes[..]);
-    let mut cursor = WaveCursor::new(base_cursor).unwrap();
+    let mut cursor = ChunkReader::new(base_cursor).unwrap();
 
     let (_, chunk_bytes) =
         cursor.read_next_chunk(Some(*b"LIST")).unwrap().unwrap();
@@ -258,14 +257,13 @@ fn append_labeled_text() {
     let initial_wave_bytes = wave_bytes(&[(fmt_head, None), (data_head, None)]);
     let mut wave_bytes = initial_wave_bytes.clone();
 
-    let cursor_end_position = {
-        let mut cursor = io::Cursor::new(&mut wave_bytes);
-        assert_eq!(cursor.stream_position().unwrap(), 0);
-        append_cue_chunk(&mut cursor, &cues[..]).unwrap();
-        cursor.seek(SeekFrom::Start(0)).unwrap();
-        append_label_chunk(&mut cursor, &labeled_texts[..]).unwrap();
-        cursor.stream_position().unwrap()
-    };
+    let mut cursor = io::Cursor::new(&mut wave_bytes);
+    assert_eq!(cursor.stream_position().unwrap(), 0);
+    let mut writer = ChunkWriter::new(cursor).unwrap();
+    writer.append_cue_chunk(&cues[..]).unwrap();
+    writer.append_label_chunk(&labeled_texts[..]).unwrap();
+    cursor = writer.restore_cursor().unwrap();
+    assert_eq!(cursor.stream_position().unwrap(), 0);
 
     let cue_start = initial_wave_bytes.len();
 
@@ -285,5 +283,4 @@ fn append_labeled_text() {
     );
 
     assert_eq!(&wave_bytes[list_start + CHUNK_HEAD_SZ..], &list_chunk_bytes,);
-    assert_eq!(cursor_end_position, wave_bytes.len() as u64);
 }

@@ -1,4 +1,4 @@
-use cuet::WaveCursor;
+use cuet::ChunkReader;
 use std::env::args;
 use std::fs::File;
 use std::io;
@@ -14,7 +14,7 @@ fn main() {
 
     let file = File::open(wav_path).unwrap();
     let reader = io::BufReader::new(file);
-    let mut wave_cursor = WaveCursor::new(reader).unwrap();
+    let mut wave_cursor = ChunkReader::new(reader).unwrap();
 
     while let Some((tag, chunk)) = wave_cursor.read_next_chunk(None).unwrap() {
         let tag_s = tag.iter().map(|&b| b as char).collect::<String>();

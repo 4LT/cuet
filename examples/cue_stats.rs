@@ -1,4 +1,4 @@
-use cuet::{extract_labeled_text_from_list, parse_cue_points, WaveCursor};
+use cuet::{extract_labeled_text_from_list, parse_cue_points, ChunkReader};
 use std::env::args;
 use std::fs::File;
 use std::io;
@@ -14,7 +14,7 @@ fn main() {
 
     let file = File::open(wav_path).unwrap();
     let reader = io::BufReader::new(file);
-    let mut wave_cursor = WaveCursor::new(reader).unwrap();
+    let mut wave_cursor = ChunkReader::new(reader).unwrap();
 
     let sample_byte_ct = wave_cursor
         .read_next_chunk(Some(*b"data"))
