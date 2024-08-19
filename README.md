@@ -1,22 +1,17 @@
-# NOT READY FOR PRIME-TIME
+# Structures and Routines for Reading and Writing WAV Cue Points and Metadata
 
-Snagging this sweet crate name before some name-squatter does
+Primarily intended for manipulating Quake sound effect loops, this library
+can read and write WAV "cue " chunks as well as associated data stored in "LIST"
+chunks.  This is a low-level library in the sense that it is the consumer's
+responsibility to ensure that WAV files created with the library are compatible
+with the requirements for software using the created files.
 
-0.0.2:
-* LITERALLY just rename README.MD to README.md so crates.io knows what's up
+# Changelog
 
-0.0.3:
-* Correct version of previous changes in changelog
-* Rewrite from scratch
-* Implement reading cue chunks and parsing cue points from said chunks
-* Implement appending cue chunks to existing WAVE files
+0.1.0:
+* First release for public consumption
+* Made public constants crate-private (shouldn't be needed by consumers)
 
-0.0.4:
-* Make tag argument option on reading chunks, return tag with chunk (breaking)
+# License
 
-0.0.5:
-* Support reading and writing LIST chunks w/ labeled text "ltxt" sub-chunks
-
-0.0.6:
-* Rename WaveCursor to ChunkReader (breaking)
-* Refactor chunk-appending API into object-oriented style (breaking)
+Triple-licensed under MIT / Apache 2.0 / CC0 (your choice)

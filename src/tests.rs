@@ -1,7 +1,6 @@
 use crate::{
-    extract_labeled_text_from_list,
-    parse_cue_points, ChunkHead, CuePoint, LabeledText, ChunkReader,
-    ChunkWriter, CHUNK_HEAD_SZ, CUE_SZ,
+    extract_labeled_text_from_list, parse_cue_points, ChunkHead, ChunkReader,
+    ChunkWriter, CuePoint, LabeledText, CHUNK_HEAD_SZ, CUE_SZ,
 };
 use io::Seek;
 use std::io;
